@@ -18,7 +18,7 @@ streamlit run app.py --server.port 8501 --server.headless true
 ```
 
 ## Structure
-- `app.py`: Streamlit UI with sidebar, chat history, quick actions, and LLM wiring
+- `app.py`: Streamlit UI with sidebar, chat history, quick actions, and LLM + RAG wiring
 - `requirements.txt`: Python dependencies
 
 ## Connect the chat to an LLM
@@ -30,6 +30,7 @@ Required:
 Optional:
 - `OPENAI_BASE_URL`: Defaults to `https://api.openai.com/v1`. For Databricks, set to your endpoint's OpenAI-compatible base, e.g. `https://<workspace-host>/serving-endpoints/<endpoint-name>/v1`.
 - `LLM_MODEL`: Model name (e.g., `gpt-4o-mini`, or the model configured on your Databricks endpoint)
+- `OPENAI_EMBED_MODEL`: Embedding model for RAG (default `text-embedding-3-small`)
 - `LLM_PROVIDER`: Free-form tag for display (e.g., `databricks`)
 
 Example env vars:
@@ -37,13 +38,19 @@ Example env vars:
 export OPENAI_API_KEY=********
 export OPENAI_BASE_URL=https://<your-dbx-host>/serving-endpoints/<endpoint>/v1
 export LLM_MODEL=meta-llama-3.1-70b-instruct
+export OPENAI_EMBED_MODEL=text-embedding-3-small
 ```
 
 Notes for Databricks:
 - Use a Personal Access Token (PAT) or configured token as `OPENAI_API_KEY`.
-- Ensure your serving endpoint exposes an OpenAI-compatible Chat Completions path.
+- Ensure your serving endpoint exposes an OpenAI-compatible Chat Completions and Embeddings path.
 
-## Next steps (Databricks)
-- Replace the stubbed data builders with calls to Databricks SQL, Unity Catalog tables, or Lakehouse APIs
-- If deploying as a Databricks app, point the launcher to `app.py`
-- If connecting to Mosaic AI or Model Serving, keep the OpenAI-compatible config above, or replace `generate_llm_response()` with a direct Databricks SDK call
+## Contextual Q&A (RAG)
+- Toggle "Use contract context (RAG)" from the sidebar.
+- Upload `.txt` or `.md` documents and click "Ingest uploads", or click "Load demo knowledge" for sample clauses.
+- The app chunks, embeds, and stores vectors in-memory; queries retrieve top-k chunks and pass them as system context to the LLM. Sources referenced are shown beneath the answer.
+
+Production notes:
+- Replace the simple in-memory vector store with Databricks Vector Search or a Delta table powered by Mosaic AI embeddings.
+- Swap the `_simple_chunk` and `_embed_texts` implementations with your preferred chunker and embedding model.
+- For multi-tenant isolation, persist vectors per user or workspace.

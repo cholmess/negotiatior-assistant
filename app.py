@@ -3,7 +3,8 @@ import pandas as pd
 import plotly.express as px
 from datetime import datetime, timedelta
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
+import numpy as np
 
 st.set_page_config(
     page_title="ShipNegotiate AI",
@@ -27,6 +28,14 @@ def initialize_session_state() -> None:
         ]
     if "pending_user_prompt" not in st.session_state:
         st.session_state.pending_user_prompt = None
+    if "use_rag" not in st.session_state:
+        st.session_state.use_rag = True
+    if "rag_chunks" not in st.session_state:
+        st.session_state.rag_chunks: List[str] = []
+    if "rag_metas" not in st.session_state:
+        st.session_state.rag_metas: List[Dict[str, Any]] = []
+    if "rag_matrix" not in st.session_state:
+        st.session_state.rag_matrix: np.ndarray | None = None  # shape: (n, d), L2-normalized
 
 
 def render_sidebar() -> None:
@@ -61,12 +70,46 @@ def render_sidebar() -> None:
         st.markdown("**Recent Alerts**")
         st.info("Credit Rating Downgrade — GlobalTrade Corp downgraded to BBB" )
 
+        st.divider()
+        st.markdown("**Knowledge base**")
+        st.checkbox("Use contract context (RAG)", key="use_rag", value=st.session_state.use_rag)
+        st.caption("Upload .txt or .md docs. We'll chunk, embed, and retrieve top-k context for Q&A.")
+        uploaded = st.file_uploader("Upload documents", accept_multiple_files=True, type=["txt", "md"])
+        col_kb1, col_kb2, col_kb3 = st.columns([1,1,1])
+        with col_kb1:
+            if st.button("Ingest uploads", use_container_width=True, type="primary") and uploaded:
+                texts_with_meta = []
+                for f in uploaded:
+                    try:
+                        raw = f.read().decode("utf-8", errors="ignore")
+                    except Exception:
+                        raw = f.read()
+                        if isinstance(raw, bytes):
+                            raw = raw.decode("utf-8", errors="ignore")
+                    texts_with_meta.append((raw, {"source": f.name}))
+                add_texts_to_kb(texts_with_meta)
+                st.success(f"Ingested {len(texts_with_meta)} file(s). KB chunks: {len(st.session_state.rag_chunks)}")
+        with col_kb2:
+            if st.button("Load demo knowledge", use_container_width=True):
+                demo_texts = _demo_contract_texts()
+                add_texts_to_kb([(t, {"source": "demo.md"}) for t in demo_texts])
+                st.success(f"Demo loaded. KB chunks: {len(st.session_state.rag_chunks)}")
+        with col_kb3:
+            if st.button("Clear KB", use_container_width=True):
+                clear_kb()
+                st.info("Knowledge base cleared")
+
+        st.caption(
+            f"KB size: {len(st.session_state.rag_chunks)} chunks | Model: {os.getenv('OPENAI_EMBED_MODEL', 'text-embedding-3-small')}"
+        )
+
         # LLM config quick view (uses env vars or Streamlit secrets)
         with st.expander("LLM configuration"):
-            provider = os.getenv("LLM_PROVIDER", "openai")
+            provider = os.getenv("LLM_PROVIDER", "openai/databricks-compatible")
             base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
             model_name = os.getenv("LLM_MODEL", "gpt-4o-mini")
-            st.write({"provider": provider, "base_url": base_url, "model": model_name})
+            embed_model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+            st.write({"provider": provider, "base_url": base_url, "chat_model": model_name, "embed_model": embed_model})
             st.caption("Set OPENAI_API_KEY (and OPENAI_BASE_URL for Databricks) in env vars or .streamlit/secrets.toml")
 
 
@@ -130,6 +173,10 @@ def render_message(message: dict) -> None:
             fig = px.line(df, x="Month", y=["Market Benchmark Rate", "Your Avg Rate"], markers=True)
             fig.update_layout(height=360, legend_title_text="")
             st.plotly_chart(fig, use_container_width=True)
+        elif message.get("kind") == "sources":
+            st.caption("Context used:")
+            for s in message.get("data", {}).get("sources", []):
+                st.write(f"- {s}")
         else:
             st.write(message["content"])
 
@@ -152,8 +199,15 @@ def _build_system_prompt() -> str:
     )
 
 
-def _convert_history_to_openai_messages(history: List[Dict[str, Any]], user_input: str) -> List[Dict[str, str]]:
+def _convert_history_to_openai_messages(history: List[Dict[str, Any]], user_input: str, context: str | None) -> List[Dict[str, str]]:
     messages: List[Dict[str, str]] = [{"role": "system", "content": _build_system_prompt()}]
+    if context:
+        messages.append({
+            "role": "system",
+            "content": (
+                "Use the following context to answer the user's question. If the answer is not contained, say you don't know.\n\n" + context
+            ),
+        })
     for msg in history[-8:]:  # last few for context
         if msg.get("kind") == "text" and msg.get("role") in ("user", "assistant"):
             messages.append({"role": msg["role"], "content": msg["content"]})
@@ -161,24 +215,21 @@ def _convert_history_to_openai_messages(history: List[Dict[str, Any]], user_inpu
     return messages
 
 
-def generate_llm_response(user_input: str) -> str:
+def _get_openai_client():
     api_key = _get_secret_env("OPENAI_API_KEY")
     base_url = _get_secret_env("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    model_name = _get_secret_env("LLM_MODEL", "gpt-4o-mini")
-
     if not api_key:
-        return (
-            "LLM is not configured. Please set OPENAI_API_KEY (and OPENAI_BASE_URL for Databricks). "
-            "See README for details."
+        raise RuntimeError(
+            "LLM is not configured. Please set OPENAI_API_KEY (and OPENAI_BASE_URL for Databricks)."
         )
+    from openai import OpenAI
+    return OpenAI(api_key=api_key, base_url=base_url)
 
-    try:
-        from openai import OpenAI
-    except Exception:
-        return "The 'openai' package is not installed. Run: pip install openai"
 
-    client = OpenAI(api_key=api_key, base_url=base_url)
-    chat_messages = _convert_history_to_openai_messages(st.session_state.messages, user_input)
+def generate_llm_response(user_input: str, context: str | None = None) -> str:
+    model_name = _get_secret_env("LLM_MODEL", "gpt-4o-mini")
+    client = _get_openai_client()
+    chat_messages = _convert_history_to_openai_messages(st.session_state.messages, user_input, context)
 
     with st.spinner("Thinking…"):
         response = client.chat.completions.create(
@@ -187,7 +238,115 @@ def generate_llm_response(user_input: str) -> str:
             temperature=0.2,
             max_tokens=700,
         )
-    return response.choices[0].message.content or ""
+    return (response.choices[0].message.content or "").strip()
+
+
+# ---------- RAG: ingest, embed, retrieve ----------
+
+def _demo_contract_texts() -> List[str]:
+    return [
+        (
+            "Master Services Agreement (MSA) — Pricing & Indexation. Base transport rate denominated in USD per metric ton. "
+            "Annual indexation capped at 3% YoY based on CPI-U. Fuel surcharge applies when Brent > $85/bbl per published table."
+        ),
+        (
+            "Termination & Renewal. Auto-renews for 12 months unless notice is provided 60 days before expiry. "
+            "Either party may terminate for material breach with 30 days cure period. Early termination fee equals 2 months average billing."
+        ),
+        (
+            "Service Levels. On-time pickup 96%, delivery 94%. Credits: 2% of monthly fees for each percentage point below threshold up to 10%. "
+            "DSO target 45 days; late payments > 60 days may trigger credit review and temporary service limits."
+        ),
+    ]
+
+
+def _simple_chunk(text: str, chunk_chars: int = 900, overlap: int = 150) -> List[str]:
+    chunks: List[str] = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + chunk_chars)
+        chunks.append(text[start:end])
+        if end == len(text):
+            break
+        start = end - overlap
+    return [c.strip() for c in chunks if c.strip()]
+
+
+def _embed_texts(texts: List[str]) -> np.ndarray:
+    embed_model = _get_secret_env("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+    client = _get_openai_client()
+    # Batch in chunks of up to 128 texts to be gentle
+    vectors: List[np.ndarray] = []
+    batch_size = 96
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        resp = client.embeddings.create(model=embed_model, input=batch)
+        arr = np.array([d.embedding for d in resp.data], dtype=np.float32)
+        # Normalize for cosine similarity via dot product
+        norms = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-12
+        arr = arr / norms
+        vectors.append(arr)
+    if not vectors:
+        return np.zeros((0, 3), dtype=np.float32)
+    return np.vstack(vectors)
+
+
+def add_texts_to_kb(texts_with_meta: List[Tuple[str, Dict[str, Any]]]) -> None:
+    all_chunks: List[str] = []
+    all_metas: List[Dict[str, Any]] = []
+    for text, meta in texts_with_meta:
+        chunks = _simple_chunk(text)
+        all_chunks.extend(chunks)
+        all_metas.extend([{**meta, "chunk_index": idx} for idx in range(len(chunks))])
+
+    if not all_chunks:
+        return
+
+    new_matrix = _embed_texts(all_chunks)
+
+    if st.session_state.rag_matrix is None or len(st.session_state.rag_chunks) == 0:
+        st.session_state.rag_chunks = list(all_chunks)
+        st.session_state.rag_metas = list(all_metas)
+        st.session_state.rag_matrix = new_matrix
+    else:
+        # Append to existing matrix
+        st.session_state.rag_chunks.extend(all_chunks)
+        st.session_state.rag_metas.extend(all_metas)
+        st.session_state.rag_matrix = np.vstack([st.session_state.rag_matrix, new_matrix])
+
+
+def clear_kb() -> None:
+    st.session_state.rag_chunks = []
+    st.session_state.rag_metas = []
+    st.session_state.rag_matrix = None
+
+
+def retrieve_context(query: str, top_k: int = 4, max_chars: int = 2400) -> Tuple[str, List[str]]:
+    if st.session_state.rag_matrix is None or len(st.session_state.rag_chunks) == 0:
+        return "", []
+    q_vec = _embed_texts([query])
+    q_vec = q_vec[0]
+    sims = st.session_state.rag_matrix @ q_vec
+    if top_k >= len(sims):
+        idxs = np.argsort(-sims)
+    else:
+        idxs = np.argpartition(-sims, top_k)[:top_k]
+        idxs = idxs[np.argsort(-sims[idxs])]
+    sources: List[str] = []
+    context_parts: List[str] = []
+    total = 0
+    for i in idxs:
+        meta = st.session_state.rag_metas[int(i)]
+        text = st.session_state.rag_chunks[int(i)]
+        label = f"Source: {meta.get('source','unknown')} (chunk {meta.get('chunk_index',0)})"
+        part = f"{label}\n{text}"
+        if total + len(part) > max_chars and context_parts:
+            break
+        context_parts.append(part)
+        total += len(part)
+        sources.append(label)
+    context = "\n\n".join(context_parts)
+    return context, sources
 
 
 def handle_prompt(prompt_text: str) -> None:
@@ -226,7 +385,11 @@ def handle_prompt(prompt_text: str) -> None:
             }
         )
     else:
-        llm_text = generate_llm_response(prompt_text)
+        context = None
+        sources: List[str] = []
+        if st.session_state.use_rag:
+            context, sources = retrieve_context(prompt_text, top_k=4)
+        llm_text = generate_llm_response(prompt_text, context=context)
         append_assistant_message(
             {
                 "role": "assistant",
@@ -234,6 +397,15 @@ def handle_prompt(prompt_text: str) -> None:
                 "content": llm_text,
             }
         )
+        if sources:
+            append_assistant_message(
+                {
+                    "role": "assistant",
+                    "kind": "sources",
+                    "content": "",
+                    "data": {"sources": sources},
+                }
+            )
 
 
 initialize_session_state()
