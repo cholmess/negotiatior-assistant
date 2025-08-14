@@ -36,6 +36,15 @@ def initialize_session_state() -> None:
         st.session_state.rag_metas: List[Dict[str, Any]] = []
     if "rag_matrix" not in st.session_state:
         st.session_state.rag_matrix: np.ndarray | None = None  # shape: (n, d), L2-normalized
+    # Filters defaults
+    if "filter_top_only" not in st.session_state:
+        st.session_state.filter_top_only = False
+    if "filter_top_n" not in st.session_state:
+        st.session_state.filter_top_n = 5
+    if "filter_relationships" not in st.session_state:
+        st.session_state.filter_relationships = ["Strategic", "Key", "Standard", "New", "At Risk"]
+    if "filter_bcs_range" not in st.session_state:
+        st.session_state.filter_bcs_range = (0, 100)
 
 
 def render_sidebar() -> None:
@@ -69,6 +78,14 @@ def render_sidebar() -> None:
         st.divider()
         st.markdown("**Recent Alerts**")
         st.info("Credit Rating Downgrade — GlobalTrade Corp downgraded to BBB" )
+
+        st.divider()
+        st.markdown("**Board Filters**")
+        st.checkbox("Top customers only", key="filter_top_only", value=st.session_state.filter_top_only)
+        st.number_input("Top N by revenue", min_value=1, max_value=50, step=1, key="filter_top_n")
+        rel_options = ["Strategic", "Key", "Standard", "New", "At Risk"]
+        st.multiselect("Relationship", options=rel_options, default=st.session_state.filter_relationships, key="filter_relationships")
+        st.slider("BCS range", 0, 100, value=st.session_state.filter_bcs_range, key="filter_bcs_range")
 
         st.divider()
         st.markdown("**Knowledge base**")
@@ -140,6 +157,71 @@ def create_risk_dataframe() -> pd.DataFrame:
         {"Customer": "NorthStar Foods", "Credit Rating": "BBB", "DSO": 58, "On-time %": 90, "Risk": "Medium"},
     ]
     return pd.DataFrame(data)
+
+
+def create_portfolio_dataframe() -> pd.DataFrame:
+    margin = create_margin_dataframe()
+    risk = create_risk_dataframe()
+    df = margin.merge(risk, on="Customer", how="left")
+    relationship_map = {
+        "GlobalTrade Corp": "Strategic",
+        "Pacific Logistics": "Key",
+        "Apex Retail Group": "Standard",
+        "EuroChem Ltd": "Strategic",
+        "NorthStar Foods": "Key",
+    }
+    bcs_map = {
+        "GlobalTrade Corp": 92,
+        "Pacific Logistics": 81,
+        "Apex Retail Group": 65,
+        "EuroChem Ltd": 88,
+        "NorthStar Foods": 73,
+    }
+    df["Relationship"] = df["Customer"].map(relationship_map).fillna("Standard")
+    df["BCS"] = df["Customer"].map(bcs_map).fillna(60)
+    return df
+
+
+def apply_board_filters(df: pd.DataFrame) -> pd.DataFrame:
+    filtered = df.copy()
+    # Relationship filter
+    rels = set(st.session_state.filter_relationships)
+    filtered = filtered[filtered["Relationship"].isin(rels)]
+    # BCS filter
+    bcs_min, bcs_max = st.session_state.filter_bcs_range
+    filtered = filtered[(filtered["BCS"] >= bcs_min) & (filtered["BCS"] <= bcs_max)]
+    # Top customers (by revenue)
+    if st.session_state.filter_top_only:
+        n = max(1, int(st.session_state.filter_top_n))
+        top_customers = filtered.nlargest(n, "Revenue (M)")["Customer"].tolist()
+        filtered = filtered[filtered["Customer"].isin(top_customers)]
+    return filtered.reset_index(drop=True)
+
+
+def render_board() -> None:
+    df = create_portfolio_dataframe()
+    filtered = apply_board_filters(df)
+    with st.expander("Board — Accounts Overview", expanded=False):
+        k1, k2, k3 = st.columns(3)
+        with k1:
+            st.metric("Accounts", len(filtered))
+        with k2:
+            avg_margin = filtered["Margin %"].mean() if not filtered.empty else 0.0
+            st.metric("Avg Margin", f"{avg_margin:.1f}%")
+        with k3:
+            avg_bcs = filtered["BCS"].mean() if not filtered.empty else 0.0
+            st.metric("Avg BCS", f"{avg_bcs:.0f}")
+        if not filtered.empty:
+            chart_df = filtered.sort_values("Revenue (M)", ascending=False).head(10)
+            fig = px.bar(chart_df, x="Customer", y="Margin %", title="Margin % by Customer (Top 10 Displayed)")
+            fig.update_layout(height=320, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(
+                filtered[["Customer", "Relationship", "BCS", "Revenue (M)", "Margin %", "Credit Rating", "Risk"]],
+                use_container_width=True,
+            )
+        else:
+            st.info("No accounts match the selected filters.")
 
 
 def create_rate_trend_dataframe(periods: int = 12) -> pd.DataFrame:
@@ -443,6 +525,7 @@ def handle_prompt(prompt_text: str) -> None:
 initialize_session_state()
 render_sidebar()
 render_header()
+render_board() # Render the board above the chat
 
 for message in st.session_state.messages:
     render_message(message)
