@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from datetime import datetime, timedelta
+import os
+from typing import List, Dict, Any
 
 st.set_page_config(
     page_title="ShipNegotiate AI",
@@ -58,6 +60,14 @@ def render_sidebar() -> None:
         st.divider()
         st.markdown("**Recent Alerts**")
         st.info("Credit Rating Downgrade — GlobalTrade Corp downgraded to BBB" )
+
+        # LLM config quick view (uses env vars or Streamlit secrets)
+        with st.expander("LLM configuration"):
+            provider = os.getenv("LLM_PROVIDER", "openai")
+            base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+            model_name = os.getenv("LLM_MODEL", "gpt-4o-mini")
+            st.write({"provider": provider, "base_url": base_url, "model": model_name})
+            st.caption("Set OPENAI_API_KEY (and OPENAI_BASE_URL for Databricks) in env vars or .streamlit/secrets.toml")
 
 
 def render_header() -> None:
@@ -124,6 +134,62 @@ def render_message(message: dict) -> None:
             st.write(message["content"])
 
 
+# ---------- LLM integration ----------
+
+def _get_secret_env(name: str, default: str | None = None) -> str | None:
+    if name in st.secrets:
+        try:
+            return st.secrets[name]
+        except Exception:
+            pass
+    return os.getenv(name, default)
+
+
+def _build_system_prompt() -> str:
+    return (
+        "You are Chris, an AI contract negotiation assistant. Be concise, data-driven, and action-oriented. "
+        "When appropriate, suggest concrete next steps, thresholds, and negotiation levers (rate, term, indexation, volume, surcharges)."
+    )
+
+
+def _convert_history_to_openai_messages(history: List[Dict[str, Any]], user_input: str) -> List[Dict[str, str]]:
+    messages: List[Dict[str, str]] = [{"role": "system", "content": _build_system_prompt()}]
+    for msg in history[-8:]:  # last few for context
+        if msg.get("kind") == "text" and msg.get("role") in ("user", "assistant"):
+            messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": user_input})
+    return messages
+
+
+def generate_llm_response(user_input: str) -> str:
+    api_key = _get_secret_env("OPENAI_API_KEY")
+    base_url = _get_secret_env("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    model_name = _get_secret_env("LLM_MODEL", "gpt-4o-mini")
+
+    if not api_key:
+        return (
+            "LLM is not configured. Please set OPENAI_API_KEY (and OPENAI_BASE_URL for Databricks). "
+            "See README for details."
+        )
+
+    try:
+        from openai import OpenAI
+    except Exception:
+        return "The 'openai' package is not installed. Run: pip install openai"
+
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    chat_messages = _convert_history_to_openai_messages(st.session_state.messages, user_input)
+
+    with st.spinner("Thinking…"):
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=chat_messages,
+            temperature=0.2,
+            max_tokens=700,
+        )
+    return response.choices[0].message.content or ""
+
+
 def handle_prompt(prompt_text: str) -> None:
     append_assistant_message({"role": "user", "kind": "text", "content": prompt_text})
 
@@ -160,14 +226,12 @@ def handle_prompt(prompt_text: str) -> None:
             }
         )
     else:
+        llm_text = generate_llm_response(prompt_text)
         append_assistant_message(
             {
                 "role": "assistant",
                 "kind": "text",
-                "content": (
-                    "I can analyze margins, assess customer risk, show market rate trends, and help craft negotiation strategies. "
-                    "Try: 'Show me margin analysis' or 'Customer risk assessment'."
-                ),
+                "content": llm_text,
             }
         )
 
