@@ -32,6 +32,7 @@ Optional:
 - `LLM_MODEL`: Model name (e.g., `gpt-4o-mini`, or the model configured on your Databricks endpoint)
 - `OPENAI_EMBED_MODEL`: Embedding model for RAG (default `text-embedding-3-small`)
 - `LLM_PROVIDER`: Free-form tag for display (e.g., `databricks`)
+- `NEGOTIATION_STYLE`: Set to `voss` to enable a Chris Voss–inspired persona (default is `voss`).
 
 Example env vars:
 ```bash
@@ -39,6 +40,7 @@ export OPENAI_API_KEY=********
 export OPENAI_BASE_URL=https://<your-dbx-host>/serving-endpoints/<endpoint>/v1
 export LLM_MODEL=meta-llama-3.1-70b-instruct
 export OPENAI_EMBED_MODEL=text-embedding-3-small
+export NEGOTIATION_STYLE=voss
 ```
 
 Notes for Databricks:
