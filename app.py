@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
 from typing import List, Dict, Any, Tuple
 import numpy as np
@@ -394,14 +394,18 @@ def generate_llm_response(user_input: str, context: str | None = None) -> str:
     client = _get_openai_client()
     chat_messages = _convert_history_to_openai_messages(st.session_state.messages, user_input, context)
 
-    with st.spinner("Thinking…"):
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=chat_messages,
-            temperature=0.2,
-            max_tokens=700,
-        )
-    return (response.choices[0].message.content or "").strip()
+    try:
+        with st.spinner("Thinking…"):
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=chat_messages,
+                temperature=0.2,
+                max_tokens=700,
+            )
+        txt = (response.choices[0].message.content or "").strip()
+        return txt
+    except Exception as e:
+        return "I hit an issue contacting the model. Please check your credentials or try again in a moment."
 
 
 # ---------- RAG: ingest, embed, retrieve ----------
@@ -438,19 +442,21 @@ def _simple_chunk(text: str, chunk_chars: int = 900, overlap: int = 150) -> List
 def _embed_texts(texts: List[str]) -> np.ndarray:
     embed_model = _get_secret_env("OPENAI_EMBED_MODEL", "text-embedding-3-small")
     client = _get_openai_client()
-    # Batch in chunks of up to 128 texts to be gentle
     vectors: List[np.ndarray] = []
     batch_size = 96
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        resp = client.embeddings.create(model=embed_model, input=batch)
-        arr = np.array([d.embedding for d in resp.data], dtype=np.float32)
-        # Normalize for cosine similarity via dot product
-        norms = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-12
-        arr = arr / norms
-        vectors.append(arr)
+    try:
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            resp = client.embeddings.create(model=embed_model, input=batch)
+            arr = np.array([d.embedding for d in resp.data], dtype=np.float32)
+            norms = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-12
+            arr = arr / norms
+            vectors.append(arr)
+    except Exception:
+        st.warning("Embedding generation failed; skipping context for this request.")
+        return np.zeros((0, 0), dtype=np.float32)
     if not vectors:
-        return np.zeros((0, 3), dtype=np.float32)
+        return np.zeros((0, 0), dtype=np.float32)
     return np.vstack(vectors)
 
 
@@ -466,13 +472,14 @@ def add_texts_to_kb(texts_with_meta: List[Tuple[str, Dict[str, Any]]]) -> None:
         return
 
     new_matrix = _embed_texts(all_chunks)
+    if new_matrix.size == 0:
+        return
 
     if st.session_state.rag_matrix is None or len(st.session_state.rag_chunks) == 0:
         st.session_state.rag_chunks = list(all_chunks)
         st.session_state.rag_metas = list(all_metas)
         st.session_state.rag_matrix = new_matrix
     else:
-        # Append to existing matrix
         st.session_state.rag_chunks.extend(all_chunks)
         st.session_state.rag_metas.extend(all_metas)
         st.session_state.rag_matrix = np.vstack([st.session_state.rag_matrix, new_matrix])
@@ -487,9 +494,14 @@ def clear_kb() -> None:
 def retrieve_context(query: str, top_k: int = 4, max_chars: int = 2400) -> Tuple[str, List[str]]:
     if st.session_state.rag_matrix is None or len(st.session_state.rag_chunks) == 0:
         return "", []
-    q_vec = _embed_texts([query])
-    q_vec = q_vec[0]
-    sims = st.session_state.rag_matrix @ q_vec
+    q_vecs = _embed_texts([query])
+    if q_vecs.size == 0:
+        return "", []
+    q_vec = q_vecs[0]
+    try:
+        sims = st.session_state.rag_matrix @ q_vec
+    except Exception:
+        return "", []
     if top_k >= len(sims):
         idxs = np.argsort(-sims)
     else:
@@ -570,6 +582,8 @@ def add_texts_to_store(prefix: str, texts_with_meta: List[Tuple[str, Dict[str, A
     if not all_chunks:
         return
     new_matrix = _embed_texts(all_chunks)
+    if new_matrix.size == 0:
+        return
     if st.session_state.get(f"{prefix}_matrix") is None or len(st.session_state.get(f"{prefix}_chunks", [])) == 0:
         st.session_state[f"{prefix}_chunks"] = list(all_chunks)
         st.session_state[f"{prefix}_metas"] = list(all_metas)
@@ -592,8 +606,14 @@ def retrieve_context_from_store(prefix: str, query: str, top_k: int = 3, max_cha
     metas = st.session_state.get(f"{prefix}_metas", [])
     if matrix is None or len(chunks) == 0:
         return "", []
-    q_vec = _embed_texts([query])[0]
-    sims = matrix @ q_vec
+    q_vecs = _embed_texts([query])
+    if q_vecs.size == 0:
+        return "", []
+    q_vec = q_vecs[0]
+    try:
+        sims = matrix @ q_vec
+    except Exception:
+        return "", []
     if top_k >= len(sims):
         idxs = np.argsort(-sims)
     else:
@@ -694,6 +714,13 @@ initialize_session_state()
 render_sidebar()
 render_header()
 render_board() # Render the board above the chat
+
+# Chat utility row
+clear_cols = st.columns([1, 5, 1])
+with clear_cols[2]:
+    if st.button("Clear chat"):
+        st.session_state.messages = st.session_state.messages[:1]
+        st.rerun()
 
 for message in st.session_state.messages:
     render_message(message)
