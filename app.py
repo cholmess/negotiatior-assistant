@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import os
 from typing import List, Dict, Any, Tuple
 import numpy as np
+from io import BytesIO
 
 st.set_page_config(
     page_title="ShipNegotiate AI",
@@ -45,6 +46,18 @@ def initialize_session_state() -> None:
         st.session_state.filter_relationships = ["Strategic", "Key", "Standard", "New", "At Risk"]
     if "filter_bcs_range" not in st.session_state:
         st.session_state.filter_bcs_range = (0, 100)
+    # Optional context stores
+    if "use_industry_kb" not in st.session_state:
+        st.session_state.use_industry_kb = False
+    if "use_country_kb" not in st.session_state:
+        st.session_state.use_country_kb = False
+    for prefix in ("industry", "country"):
+        if f"{prefix}_chunks" not in st.session_state:
+            st.session_state[f"{prefix}_chunks"] = []
+        if f"{prefix}_metas" not in st.session_state:
+            st.session_state[f"{prefix}_metas"] = []
+        if f"{prefix}_matrix" not in st.session_state:
+            st.session_state[f"{prefix}_matrix"] = None
 
 
 def render_sidebar() -> None:
@@ -119,6 +132,42 @@ def render_sidebar() -> None:
         st.caption(
             f"KB size: {len(st.session_state.rag_chunks)} chunks | Model: {os.getenv('OPENAI_EMBED_MODEL', 'text-embedding-3-small')}"
         )
+
+        with st.expander("Industry report (optional)", expanded=False):
+            st.checkbox("Use industry context", key="use_industry_kb", value=st.session_state.use_industry_kb)
+            industry_files = st.file_uploader(
+                "Upload industry report(s)", accept_multiple_files=True, type=["pdf", "docx", "txt", "md"], key="industry_upload"
+            )
+            c1, c2, c3 = st.columns([1,1,1])
+            with c1:
+                if st.button("Ingest industry", use_container_width=True) and industry_files:
+                    texts_with_meta = _read_files_to_texts(industry_files, category="industry")
+                    add_texts_to_store("industry", texts_with_meta)
+                    st.success(f"Industry chunks: {len(st.session_state['industry_chunks'])}")
+            with c2:
+                st.caption(f"Chunks: {len(st.session_state['industry_chunks'])}")
+            with c3:
+                if st.button("Clear industry", use_container_width=True):
+                    clear_store("industry")
+                    st.info("Industry store cleared")
+
+        with st.expander("Country macro report (optional)", expanded=False):
+            st.checkbox("Use country macro context", key="use_country_kb", value=st.session_state.use_country_kb)
+            country_files = st.file_uploader(
+                "Upload country macro report(s)", accept_multiple_files=True, type=["pdf", "docx", "txt", "md"], key="country_upload"
+            )
+            c1b, c2b, c3b = st.columns([1,1,1])
+            with c1b:
+                if st.button("Ingest country macro", use_container_width=True) and country_files:
+                    texts_with_meta = _read_files_to_texts(country_files, category="country")
+                    add_texts_to_store("country", texts_with_meta)
+                    st.success(f"Country chunks: {len(st.session_state['country_chunks'])}")
+            with c2b:
+                st.caption(f"Chunks: {len(st.session_state['country_chunks'])}")
+            with c3b:
+                if st.button("Clear country", use_container_width=True):
+                    clear_store("country")
+                    st.info("Country store cleared")
 
         # LLM config quick view (uses env vars or Streamlit secrets)
         with st.expander("LLM configuration"):
@@ -463,6 +512,110 @@ def retrieve_context(query: str, top_k: int = 4, max_chars: int = 2400) -> Tuple
     return context, sources
 
 
+def _read_files_to_texts(files: List[Any], category: str) -> List[Tuple[str, Dict[str, Any]]]:
+    results: List[Tuple[str, Dict[str, Any]]] = []
+    for f in files:
+        name = getattr(f, "name", "uploaded")
+        try:
+            data = f.read()
+        except Exception:
+            data = f.getvalue() if hasattr(f, "getvalue") else b""
+        if not isinstance(data, (bytes, bytearray)):
+            try:
+                data = bytes(data)
+            except Exception:
+                data = b""
+        text = extract_text_from_bytes(name=name, data=data)
+        if text.strip():
+            results.append((text, {"source": name, "category": category}))
+    return results
+
+
+def extract_text_from_bytes(name: str, data: bytes) -> str:
+    ext = os.path.splitext(name.lower())[1]
+    if ext == ".pdf":
+        try:
+            from pypdf import PdfReader
+            buff = BytesIO(data)
+            reader = PdfReader(buff)
+            pages = []
+            for p in reader.pages:
+                t = p.extract_text() or ""
+                if t:
+                    pages.append(t)
+            return "\n\n".join(pages)
+        except Exception:
+            pass
+    if ext == ".docx":
+        try:
+            from docx import Document
+            buff = BytesIO(data)
+            doc = Document(buff)
+            return "\n".join([para.text for para in doc.paragraphs])
+        except Exception:
+            pass
+    try:
+        return data.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def add_texts_to_store(prefix: str, texts_with_meta: List[Tuple[str, Dict[str, Any]]]) -> None:
+    all_chunks: List[str] = []
+    all_metas: List[Dict[str, Any]] = []
+    for text, meta in texts_with_meta:
+        chunks = _simple_chunk(text)
+        all_chunks.extend(chunks)
+        all_metas.extend([{**meta, "chunk_index": idx} for idx in range(len(chunks))])
+    if not all_chunks:
+        return
+    new_matrix = _embed_texts(all_chunks)
+    if st.session_state.get(f"{prefix}_matrix") is None or len(st.session_state.get(f"{prefix}_chunks", [])) == 0:
+        st.session_state[f"{prefix}_chunks"] = list(all_chunks)
+        st.session_state[f"{prefix}_metas"] = list(all_metas)
+        st.session_state[f"{prefix}_matrix"] = new_matrix
+    else:
+        st.session_state[f"{prefix}_chunks"].extend(all_chunks)
+        st.session_state[f"{prefix}_metas"].extend(all_metas)
+        st.session_state[f"{prefix}_matrix"] = np.vstack([st.session_state[f"{prefix}_matrix"], new_matrix])
+
+
+def clear_store(prefix: str) -> None:
+    st.session_state[f"{prefix}_chunks"] = []
+    st.session_state[f"{prefix}_metas"] = []
+    st.session_state[f"{prefix}_matrix"] = None
+
+
+def retrieve_context_from_store(prefix: str, query: str, top_k: int = 3, max_chars: int = 1600) -> Tuple[str, List[str]]:
+    matrix = st.session_state.get(f"{prefix}_matrix")
+    chunks = st.session_state.get(f"{prefix}_chunks", [])
+    metas = st.session_state.get(f"{prefix}_metas", [])
+    if matrix is None or len(chunks) == 0:
+        return "", []
+    q_vec = _embed_texts([query])[0]
+    sims = matrix @ q_vec
+    if top_k >= len(sims):
+        idxs = np.argsort(-sims)
+    else:
+        idxs = np.argpartition(-sims, top_k)[:top_k]
+        idxs = idxs[np.argsort(-sims[idxs])]
+    sources: List[str] = []
+    parts: List[str] = []
+    total = 0
+    for i in idxs:
+        meta = metas[int(i)]
+        text = chunks[int(i)]
+        label = f"{prefix.capitalize()} Source: {meta.get('source','unknown')} (chunk {meta.get('chunk_index',0)})"
+        part = f"{label}\n{text}"
+        if total + len(part) > max_chars and parts:
+            break
+        parts.append(part)
+        total += len(part)
+        sources.append(label)
+    context = "\n\n".join(parts)
+    return context, sources
+
+
 def handle_prompt(prompt_text: str) -> None:
     append_assistant_message({"role": "user", "kind": "text", "content": prompt_text})
 
@@ -501,9 +654,24 @@ def handle_prompt(prompt_text: str) -> None:
     else:
         context = None
         sources: List[str] = []
+        context_parts: List[str] = []
         if st.session_state.use_rag:
-            context, sources = retrieve_context(prompt_text, top_k=4)
-        llm_text = generate_llm_response(prompt_text, context=context)
+            c, s = retrieve_context(prompt_text, top_k=4)
+            if c:
+                context_parts.append("General context:\n" + c)
+                sources.extend(s)
+        if st.session_state.use_industry_kb:
+            c, s = retrieve_context_from_store("industry", prompt_text, top_k=3)
+            if c:
+                context_parts.append("Industry context:\n" + c)
+                sources.extend(s)
+        if st.session_state.use_country_kb:
+            c, s = retrieve_context_from_store("country", prompt_text, top_k=3)
+            if c:
+                context_parts.append("Country macro context:\n" + c)
+                sources.extend(s)
+        aggregated = "\n\n---\n\n".join(context_parts) if context_parts else None
+        llm_text = generate_llm_response(prompt_text, context=aggregated)
         append_assistant_message(
             {
                 "role": "assistant",
