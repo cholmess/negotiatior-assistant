@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+from plotly import graph_objects as go
 from datetime import datetime
 import os
 from typing import List, Dict, Any, Tuple
@@ -12,6 +13,9 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+FEEDBACK_PATH = "/workspace/data/feedback.csv"
+os.makedirs(os.path.dirname(FEEDBACK_PATH), exist_ok=True)
 
 
 def initialize_session_state() -> None:
@@ -231,6 +235,157 @@ def create_portfolio_dataframe() -> pd.DataFrame:
     return df
 
 
+# ---------- Scenario modeling ----------
+
+def compute_scenario(
+    revenue_m: float,
+    cogs_m: float,
+    price_pct: float,
+    volume_pct: float,
+    discount_pct: float,
+    indexation_pct: float,
+    term_months: int,
+) -> Dict[str, float]:
+    term_years = max(0, term_months) / 12.0
+
+    base_rev = revenue_m
+    base_cogs = cogs_m
+    base_profit = base_rev - base_cogs
+
+    # Revenue multipliers
+    price_mult = 1 + price_pct / 100.0
+    vol_mult = 1 + volume_pct / 100.0
+    disc_mult = 1 - discount_pct / 100.0
+    index_mult = 1 + (indexation_pct / 100.0) * term_years
+
+    # Simple model: COGS scales with volume and partially with indexation (30%)
+    new_rev = base_rev * price_mult * vol_mult * disc_mult * index_mult
+    new_cogs = base_cogs * vol_mult * (1 + 0.3 * (indexation_pct / 100.0) * term_years)
+    new_profit = new_rev - new_cogs
+
+    # Waterfall components (approximate deltas to profit)
+    dp_price = base_rev * (price_pct / 100.0)
+    dp_volume = (base_rev * price_mult * (volume_pct / 100.0)) - (base_cogs * (volume_pct / 100.0))
+    dp_discount = -(base_rev * price_mult * vol_mult * (discount_pct / 100.0))
+    dp_index = (
+        base_rev * price_mult * vol_mult * (indexation_pct / 100.0) * term_years
+        - base_cogs * vol_mult * 0.3 * (indexation_pct / 100.0) * term_years
+    )
+
+    return {
+        "base_rev": base_rev,
+        "base_cogs": base_cogs,
+        "base_profit": base_profit,
+        "new_rev": new_rev,
+        "new_cogs": new_cogs,
+        "new_profit": new_profit,
+        "dp_price": dp_price,
+        "dp_volume": dp_volume,
+        "dp_discount": dp_discount,
+        "dp_index": dp_index,
+        "margin_pct": (new_profit / new_rev * 100.0) if new_rev else 0.0,
+        "margin_delta_pct": ((new_profit / new_rev) - (base_profit / base_rev)) * 100.0 if base_rev and new_rev else 0.0,
+    }
+
+
+def render_scenario_modeler() -> None:
+    st.markdown("### Scenario modeling")
+    df = create_portfolio_dataframe()
+
+    col_sel, col_blank = st.columns([2, 3])
+    with col_sel:
+        choice = st.selectbox("Account", options=["Custom baseline"] + df["Customer"].tolist())
+        if choice == "Custom baseline":
+            base_rev = st.number_input("Baseline revenue (M)", min_value=0.0, value=5.0, step=0.1)
+            base_cogs = st.number_input("Baseline COGS (M)", min_value=0.0, value=4.0, step=0.1)
+        else:
+            row = df[df["Customer"] == choice].iloc[0]
+            base_rev = float(row["Revenue (M)"])
+            base_cogs = float(row["COGS (M)"])
+            st.caption(f"Margin base: {(base_rev - base_cogs) / base_rev * 100:.1f}%")
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        price_pct = st.number_input("Price %", value=2.0, step=0.5, min_value=-25.0, max_value=25.0)
+    with col2:
+        volume_pct = st.number_input("Volume %", value=0.0, step=1.0, min_value=-50.0, max_value=50.0)
+    with col3:
+        discount_pct = st.number_input("Discount %", value=0.0, step=0.5, min_value=0.0, max_value=50.0)
+    with col4:
+        indexation_pct = st.number_input("Indexation % (YoY cap)", value=2.0, step=0.25, min_value=0.0, max_value=10.0)
+    with col5:
+        term_months = st.number_input("Term (months)", value=12, step=3, min_value=3, max_value=60)
+
+    res = compute_scenario(base_rev, base_cogs, price_pct, volume_pct, discount_pct, indexation_pct, term_months)
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("New margin", f"{res['margin_pct']:.1f}%")
+    with m2:
+        st.metric("Δ Margin", f"{res['margin_delta_pct']:.1f} pp")
+    with m3:
+        st.metric("Revenue", f"{res['new_rev']:.2f} M")
+    with m4:
+        st.metric("Profit", f"{res['new_profit']:.2f} M")
+
+    fig = go.Figure(
+        go.Waterfall(
+            name="Scenario",
+            orientation="v",
+            measure=["absolute", "relative", "relative", "relative", "relative", "total"],
+            x=[
+                "Base profit",
+                "Price",
+                "Volume",
+                "Discount",
+                "Indexation",
+                "New profit",
+            ],
+            y=[
+                res["base_profit"],
+                res["dp_price"],
+                res["dp_volume"],
+                res["dp_discount"],
+                res["dp_index"],
+                0,
+            ],
+        )
+    )
+    fig.update_layout(height=360, showlegend=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# ---------- Feedback utilities ----------
+
+def _read_feedback_df() -> pd.DataFrame:
+    if not os.path.exists(FEEDBACK_PATH):
+        return pd.DataFrame(columns=["ts", "msg_index", "role", "kind", "rating", "comment", "user_prompt", "answer_preview"])
+    try:
+        return pd.read_csv(FEEDBACK_PATH)
+    except Exception:
+        return pd.DataFrame(columns=["ts", "msg_index", "role", "kind", "rating", "comment", "user_prompt", "answer_preview"])
+
+
+def _save_feedback(record: Dict[str, Any]) -> None:
+    df = _read_feedback_df()
+    df = pd.concat([df, pd.DataFrame([record])], ignore_index=True)
+    df.to_csv(FEEDBACK_PATH, index=False)
+
+
+def render_feedback_dashboard() -> None:
+    with st.expander("Feedback dashboard", expanded=False):
+        df = _read_feedback_df()
+        pos = int((df["rating"] == 1).sum()) if not df.empty else 0
+        neg = int((df["rating"] == -1).sum()) if not df.empty else 0
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("👍", pos)
+        with c2:
+            st.metric("👎", neg)
+        if not df.empty:
+            st.dataframe(df.tail(20), use_container_width=True)
+
+
 def apply_board_filters(df: pd.DataFrame) -> pd.DataFrame:
     filtered = df.copy()
     # Relationship filter
@@ -286,7 +441,7 @@ def append_assistant_message(message: dict) -> None:
     st.session_state.messages.append(message)
 
 
-def render_message(message: dict) -> None:
+def render_message(idx: int, message: dict) -> None:
     with st.chat_message(message["role"]):
         if message.get("kind") == "margin_analysis":
             st.write(message["content"])
@@ -310,6 +465,42 @@ def render_message(message: dict) -> None:
                 st.write(f"- {s}")
         else:
             st.write(message["content"])
+
+        # Feedback controls for assistant messages only
+        if message.get("role") == "assistant" and message.get("kind") != "sources":
+            fb_cols = st.columns([0.1, 0.1, 0.8])
+            with fb_cols[0]:
+                if st.button("👍", key=f"fb_up_{idx}"):
+                    prior_user = ""
+                    if idx > 0 and st.session_state.messages[idx - 1].get("role") == "user":
+                        prior_user = st.session_state.messages[idx - 1].get("content", "")
+                    _save_feedback({
+                        "ts": datetime.utcnow().isoformat(),
+                        "msg_index": idx,
+                        "role": message.get("role"),
+                        "kind": message.get("kind"),
+                        "rating": 1,
+                        "comment": "",
+                        "user_prompt": prior_user,
+                        "answer_preview": (message.get("content", "") or "")[:240],
+                    })
+                    st.toast("Thanks for the feedback!", icon="✅")
+            with fb_cols[1]:
+                if st.button("👎", key=f"fb_dn_{idx}"):
+                    prior_user = ""
+                    if idx > 0 and st.session_state.messages[idx - 1].get("role") == "user":
+                        prior_user = st.session_state.messages[idx - 1].get("content", "")
+                    _save_feedback({
+                        "ts": datetime.utcnow().isoformat(),
+                        "msg_index": idx,
+                        "role": message.get("role"),
+                        "kind": message.get("kind"),
+                        "rating": -1,
+                        "comment": "",
+                        "user_prompt": prior_user,
+                        "answer_preview": (message.get("content", "") or "")[:240],
+                    })
+                    st.toast("Recorded. You can add details in the Feedback dashboard.", icon="✍️")
 
 
 # ---------- LLM integration ----------
@@ -714,6 +905,8 @@ initialize_session_state()
 render_sidebar()
 render_header()
 render_board() # Render the board above the chat
+render_scenario_modeler()
+render_feedback_dashboard()
 
 # Chat utility row
 clear_cols = st.columns([1, 5, 1])
@@ -722,8 +915,8 @@ with clear_cols[2]:
         st.session_state.messages = st.session_state.messages[:1]
         st.rerun()
 
-for message in st.session_state.messages:
-    render_message(message)
+for i, message in enumerate(st.session_state.messages):
+    render_message(i, message)
 
 cta_cols = st.columns([1, 1, 1])
 with cta_cols[0]:
